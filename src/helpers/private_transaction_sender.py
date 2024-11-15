@@ -103,8 +103,7 @@ class PrivateTransactionSender:
 
             response_json = response.json()
             if 'error' in response_json:
-                self.logger.error(f"Flashbots error: {response_json['error']}")
-                return None, tx
+                self.logger.error(f"Flashbots error: {response_json['error']['message']}")
 
             tx_hash = self.web3.keccak(signed_tx.rawTransaction).hex()
             self.logger.info(f"Transaction sent as private: {tx_hash}")
@@ -127,8 +126,12 @@ class PrivateTransactionSender:
         """
         try:
             receipt = self.web3.eth.wait_for_transaction_receipt(tx_hash, timeout=timeout)
-            self.logger.info(f"Transaction {tx_hash} confirmed in block {receipt.blockNumber}")
-            return receipt
+            if receipt.status == 1: 
+                self.logger.info(f"Transaction {tx_hash} confirmed in block {receipt.blockNumber}")
+                return receipt
+            else:
+                self.logger.error(f"Transaction {tx_hash} failed in block {receipt.blockNumber}")
+                return None
         except TransactionNotFound:
             self.logger.error(f"Transaction {tx_hash} not found within timeout.")
             return None
@@ -229,10 +232,15 @@ if __name__ == "__main__":
 
             # Monitor transaction
             receipt = private_tx_sender.monitor_transaction(tx_hash)
-            if receipt:
-                logging.info(f"Transaction confirmed in block {receipt.blockNumber}")
-            else:
-                logging.error("Failed to confirm transaction.")
+            try:
+                receipt = private_tx_sender.monitor_transaction(tx_hash, timeout=600) 
+                if receipt:
+                    logging.info(f"Transaction confirmed in block {receipt.blockNumber}")
+                else:
+                    logging.error("Transaction not confirmed within the timeout period.")
+            except Exception as e:
+                logging.error(f"An error occurred while monitoring the transaction: {e}")
+
         else:
             logging.error("Failed to send transaction.")
 
