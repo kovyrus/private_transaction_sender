@@ -1,16 +1,14 @@
-# src/helpers/private_transaction_sender.py
-
+from web3.middleware import geth_poa_middleware
 import json
-import requests
 import logging
+import asyncio
 from typing import Optional, Tuple
 from eth_account import messages, Account
 from eth_account.signers.local import LocalAccount
 from web3 import Web3
-from web3.types import TxParams, TxReceipt
+import aiohttp
 from flashbots import flashbot
 from src.config.settings import Config
-from web3.exceptions import TransactionNotFound, ContractLogicError
 
 class PrivateTransactionSender:
     def __init__(self, web3: Optional[Web3] = None, websocket_uri: Optional[str] = None):
@@ -71,6 +69,8 @@ class PrivateTransactionSender:
         if not self.web3.is_connected():
             self.logger.error("Unable to connect to the Ethereum node via WebSocket.")
             raise ConnectionError("Unable to connect to the Ethereum node via WebSocket.")
+        # Correct way to add middleware in web3.py version 5.0.0+
+        self.web3.middleware_onion.inject(geth_poa_middleware, layer=0)  # For POA networks
         self.logger.info("Connected to Ethereum node.")
 
     def _initialize_flashbots(self):
@@ -79,20 +79,13 @@ class PrivateTransactionSender:
         flashbot(self.web3, self.account)
         self.logger.info(f"Flashbots initialized for account: {self.account.address}")
 
-    def send_private_transaction(self, tx: TxParams) -> Tuple[Optional[str], TxParams]:
-        """
-        Sends a private transaction via Flashbots.
-
-        :param tx: Transaction data dictionary.
-        :return: Tuple (tx_hash, tx) if successfully sent, otherwise (None, tx).
-        """
+    async def send_private_transaction(self, tx: dict) -> Tuple[Optional[str], dict]:
+        """Sends a private transaction via Flashbots asynchronously."""
         try:
-            # Sign the transaction
             signed_tx = self.account.sign_transaction(tx)
             signed_tx_hex = signed_tx.rawTransaction.hex()
             self.logger.info(f"Signed transaction: {signed_tx_hex}")
 
-            # Form JSON-RPC payload
             payload = {
                 "jsonrpc": "2.0",
                 "id": 1,
@@ -119,62 +112,78 @@ class PrivateTransactionSender:
             }
 
             self.logger.info(f"Sending Flashbots transaction payload: {request_body}")
-            response = requests.post('https://relay.flashbots.net', data=request_body, headers=headers)
-
-            if response.status_code != 200:
-                self.logger.error(f"Flashbots relay error: {response.status_code}, {response.text}")
-                return None, tx
-
-            response_json = response.json()
-            if 'error' in response_json:
-                self.logger.error(f"Flashbots error: {response_json['error']['message']}")
+            async with aiohttp.ClientSession() as session:
+                async with session.post('https://relay.flashbots.net', data=request_body, headers=headers) as response:
+                    if response.status != 200:
+                        self.logger.error(f"Flashbots relay error: {response.status}, {response.text}")
+                        return None, tx
+                    else:
+                        response_json = await response.json()
+                        self.logger.info(f"Flashbots response: {json.dumps(response_json, indent=2)}")
+                        if 'error' in response_json:
+                            self.logger.error(f"Flashbots error: {response_json['error']['message']}")
 
             tx_hash = self.web3.keccak(signed_tx.rawTransaction).hex()
             self.logger.info(f"Transaction sent as private: {tx_hash}")
             return tx_hash, tx
 
-        except requests.exceptions.RequestException as e:
+        except aiohttp.ClientError as e:
             self.logger.exception(f"Network error: {e}")
             return None, tx
         except Exception as e:
             self.logger.exception(f"Unexpected error: {e}")
             return None, tx
 
-    def monitor_transaction(self, tx_hash: str, timeout: int = 360) -> Optional[TxReceipt]:
-        """
-        Monitors a transaction until it is confirmed.
-
-        :param tx_hash: Transaction hash to monitor.
-        :param timeout: Maximum wait time in seconds.
-        :return: Transaction receipt or None if unsuccessful.
-        """
+    async def monitor_transaction(self, tx_hash: str, timeout: int = 360) -> Optional[dict]:
+        """Monitors a transaction asynchronously until it is confirmed."""
         try:
-            receipt = self.web3.eth.wait_for_transaction_receipt(tx_hash, timeout=timeout)
+            receipt = await asyncio.to_thread(self.web3.eth.wait_for_transaction_receipt, tx_hash, timeout=timeout)
             if receipt.status == 1:
                 self.logger.info(f"Transaction {tx_hash} confirmed in block {receipt.blockNumber}")
                 return receipt
             else:
                 self.logger.error(f"Transaction {tx_hash} failed in block {receipt.blockNumber}")
                 return None
-        except TransactionNotFound:
-            self.logger.error(f"Transaction {tx_hash} not found within timeout.")
-            return None
         except Exception as e:
             self.logger.exception(f"Error monitoring transaction: {e}")
             return None
 
+    async def send_approve_transaction(self, token_address: str, spender_address: str, amount: int):
+        """Sends an approve transaction for the specified token asynchronously."""
+        try:
+            token_abi = await self._get_token_abi(token_address)
 
-if __name__ == "__main__":
-    try:
-        private_tx_sender = PrivateTransactionSender()
-        web3, account = private_tx_sender.web3, private_tx_sender.account
+            token_contract = self.web3.eth.contract(address=self.web3.to_checksum_address(token_address), abi=token_abi)
 
-        # Example: Sending an approve transaction
-        token_address = '0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48'  # USDC
-        spender_address = '0x7a250d5630B4cF539739dF2C5dAcb4c659F2488D'  # Uniswap V2 Router
-        amount = web3.to_wei(1, 'ether')
+            base_fee = self.web3.eth.get_block('latest').get('baseFeePerGas', self.web3.to_wei(30, 'gwei'))
+            priority_fee = self.web3.eth.max_priority_fee
+            nonce = self.web3.eth.get_transaction_count(self.account.address)
 
-        token_abi = [{
+            tx_params = {
+                'from': self.account.address,
+                'nonce': nonce,
+                'maxPriorityFeePerGas': priority_fee,
+                'maxFeePerGas': base_fee + priority_fee,
+                'chainId': self.web3.eth.chain_id,
+                'type': 2
+            }
+
+            gas = await asyncio.to_thread(token_contract.functions.approve(spender_address, amount).estimate_gas, {'from': self.account.address})
+            tx_params['gas'] = gas
+
+            tx = token_contract.functions.approve(spender_address, amount).build_transaction(tx_params)
+            tx_hash, _ = await self.send_private_transaction(tx)
+
+            if tx_hash:
+                receipt = await self.monitor_transaction(tx_hash)
+                if receipt:
+                    self.logger.info(f"Transaction confirmed in block {receipt.blockNumber}")
+        except Exception as e:
+            self.logger.exception(f"Error sending approve transaction: {e}")
+
+    async def _get_token_abi(self, token_address: str):
+        """Fetch the ABI for a given token contract address."""
+        return [{
             "constant": False,
             "inputs": [
                 {"name": "_spender", "type": "address"},
@@ -185,30 +194,19 @@ if __name__ == "__main__":
             "type": "function"
         }]
 
-        token_contract = web3.eth.contract(address=web3.to_checksum_address(token_address), abi=token_abi)
+async def main():
+    try:
+        private_tx_sender = PrivateTransactionSender()
 
-        base_fee = web3.eth.get_block('latest').get('baseFeePerGas', web3.to_wei(30, 'gwei'))
-        priority_fee = web3.eth.max_priority_fee
-        nonce = web3.eth.get_transaction_count(account.address)
+        # Example: Sending an approve transaction
+        token_address = '0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48'  # USDC
+        spender_address = '0x7a250d5630B4cF539739dF2C5dAcb4c659F2488D'  # Uniswap V2 Router
+        amount = private_tx_sender.web3.to_wei(100, 'ether')
 
-        tx_params = {
-            'from': account.address,
-            'nonce': nonce,
-            'maxPriorityFeePerGas': priority_fee,
-            'maxFeePerGas': base_fee + priority_fee,
-            'chainId': web3.eth.chain_id,
-            'type': 2
-        }
+        await private_tx_sender.send_approve_transaction(token_address, spender_address, amount)
 
-        gas = token_contract.functions.approve(spender_address, amount).estimate_gas({'from': account.address})
-        tx_params['gas'] = gas
-
-        tx = token_contract.functions.approve(spender_address, amount).build_transaction(tx_params)
-        tx_hash, _ = private_tx_sender.send_private_transaction(tx)
-
-        if tx_hash:
-            receipt = private_tx_sender.monitor_transaction(tx_hash)
-            if receipt:
-                logging.info(f"Transaction confirmed in block {receipt.blockNumber}")
     except Exception as e:
-        logging.exception(f"Error: {e}")
+        print(f"Error: {e}")
+
+if __name__ == "__main__":
+    asyncio.run(main())
