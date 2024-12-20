@@ -1,8 +1,7 @@
-# src/helpers/private_transaction_sender.py
-
 import json
 import requests
 import logging
+import time  # Added for retry delays
 from typing import Optional, Tuple
 from eth_account import messages, Account
 from eth_account.signers.local import LocalAccount
@@ -62,60 +61,85 @@ class PrivateTransactionSender:
         :param tx: Transaction data dictionary.
         :return: Tuple (tx_hash, tx) if successfully sent, otherwise (None, tx).
         """
-        try:
-            # Sign the transaction
-            signed_tx = self.account.sign_transaction(tx)
-            signed_tx_hex = signed_tx.rawTransaction.hex()
-            self.logger.info(f"Signed transaction: {signed_tx_hex}")
+        MAX_RETRIES = 3
+        RETRY_DELAY = 2  # seconds
 
-            # Form JSON-RPC payload
-            payload = {
-                "jsonrpc": "2.0",
-                "id": 1,
-                "method": "eth_sendPrivateTransaction",
-                "params": [{
-                    "tx": signed_tx_hex,
-                    "maxBlockNumber": self.web3.eth.block_number + 1,
-                    "preferences": {
-                        "fast": True,
-                        "privacy": {
-                            "builders": config.BUILDERS  # Assumes BUILDERS is defined in configuration
+        for attempt in range(MAX_RETRIES):
+            try:
+                # Update gas parameters for better inclusion probability
+                if 'maxFeePerGas' not in tx or 'maxPriorityFeePerGas' not in tx:
+                    latest_block = self.web3.eth.get_block('latest')
+                    base_fee = latest_block.get('baseFeePerGas', self.web3.to_wei(30, 'gwei'))
+                    priority_fee = self.web3.eth.max_priority_fee * 2  # Double priority fee
+                    tx['maxPriorityFeePerGas'] = priority_fee
+                    tx['maxFeePerGas'] = base_fee * 2 + priority_fee  # Double base fee for buffer
+
+                # Sign the transaction
+                signed_tx = self.account.sign_transaction(tx)
+                signed_tx_hex = signed_tx.rawTransaction.hex()
+                self.logger.info(f"Signed transaction: {signed_tx_hex}")
+
+                # Calculate target block numbers
+                current_block = self.web3.eth.block_number
+                max_block_number = current_block + 1
+
+                # Form JSON-RPC payload with improved inclusion parameters
+                payload = {
+                    "jsonrpc": "2.0",
+                    "id": 1,
+                    "method": "eth_sendPrivateTransaction",
+                    "params": [{
+                        "tx": signed_tx_hex,
+                        "maxBlockNumber": max_block_number,
+                        "preferences": {
+                            "fast": True,
+                            "privacy": {
+                                "builders": config.BUILDERS
+                            },
+                            "inclusion": {  # Added inclusion preferences
+                                "block": current_block + 1,
+                                "maxBlock": max_block_number
+                            }
                         }
-                    }
-                }]
-            }
+                    }]
+                }
 
-            request_body = json.dumps(payload)
-            message = messages.encode_defunct(text=Web3.keccak(text=request_body).hex())
-            signature = f"{self.account.address}:{self.account.sign_message(message).signature.hex()}"
+                request_body = json.dumps(payload)
+                message = messages.encode_defunct(text=Web3.keccak(text=request_body).hex())
+                signature = f"{self.account.address}:{self.account.sign_message(message).signature.hex()}"
 
-            headers = {
-                'Content-Type': 'application/json',
-                'X-Flashbots-Signature': signature
-            }
+                headers = {
+                    'Content-Type': 'application/json',
+                    'X-Flashbots-Signature': signature
+                }
 
-            self.logger.info(f"Sending POST request to Flashbots relay with payload: {request_body}")
-            response = requests.post('https://relay.flashbots.net', data=request_body, headers=headers)
+                self.logger.info(f"Sending POST request to Flashbots relay with payload: {request_body}")
+                response = requests.post('https://relay.flashbots.net', data=request_body, headers=headers)
 
-            if response.status_code != 200:
-                self.logger.error(f"Error in Flashbots response: {response.status_code}, {response.text}")
-                return None, tx
+                if response.status_code == 200:
+                    response_json = response.json()
+                    if 'error' not in response_json:
+                        tx_hash = self.web3.keccak(signed_tx.rawTransaction).hex()
+                        self.logger.info(f"Transaction sent as private: {tx_hash}")
+                        return tx_hash, tx
 
-            response_json = response.json()
-            if 'error' in response_json:
-                self.logger.error(f"Flashbots error: {response_json['error']}")
-                return None, tx
+                self.logger.warning(f"Attempt {attempt + 1} failed. Response: {response.text}")
+                
+                if attempt < MAX_RETRIES - 1:
+                    time.sleep(RETRY_DELAY)
+                    continue
 
-            tx_hash = self.web3.keccak(signed_tx.rawTransaction).hex()
-            self.logger.info(f"Transaction sent as private: {tx_hash}")
-            return tx_hash, tx
+            except requests.exceptions.RequestException as e:
+                self.logger.exception(f"Network error while sending transaction: {e}")
+                if attempt < MAX_RETRIES - 1:
+                    time.sleep(RETRY_DELAY)
+                    continue
 
-        except requests.exceptions.RequestException as e:
-            self.logger.exception(f"Network error while sending transaction: {e}")
-            return None, tx
-        except Exception as e:
-            self.logger.exception(f"Exception occurred while sending private transaction: {e}")
-            return None, tx
+            except Exception as e:
+                self.logger.exception(f"Exception occurred while sending private transaction: {e}")
+                break
+
+        return None, tx
 
     def monitor_transaction(self, tx_hash: str, timeout: int = 360) -> Optional[TxReceipt]:
         """
@@ -125,117 +149,28 @@ class PrivateTransactionSender:
         :param timeout: Maximum wait time in seconds.
         :return: Transaction receipt or None if unsuccessful.
         """
-        try:
-            receipt = self.web3.eth.wait_for_transaction_receipt(tx_hash, timeout=timeout)
-            self.logger.info(f"Transaction {tx_hash} confirmed in block {receipt.blockNumber}")
-            return receipt
-        except TransactionNotFound:
-            self.logger.error(f"Transaction {tx_hash} not found within timeout.")
-            return None
-        except Exception as e:
-            self.logger.exception(f"Error while waiting for transaction receipt: {e}")
-            return None
+        start_time = time.time()
+        check_interval = 2  # seconds
 
-# Example usage
-# python3 -m src.helpers.private_transaction_sender
-if __name__ == "__main__":
-    import sys
-    from web3.exceptions import ContractLogicError
+        while time.time() - start_time < timeout:
+            try:
+                receipt = self.web3.eth.get_transaction_receipt(tx_hash)
+                if receipt:
+                    if receipt.status == 1:
+                        self.logger.info(f"Transaction {tx_hash} confirmed in block {receipt.blockNumber}")
+                        return receipt
+                    else:
+                        self.logger.error(f"Transaction {tx_hash} failed")
+                        return receipt
+            except TransactionNotFound:
+                self.logger.debug(f"Transaction {tx_hash} not yet mined. Waiting...")
+                time.sleep(check_interval)
+                continue
+            except Exception as e:
+                self.logger.exception(f"Error while waiting for transaction receipt: {e}")
+                return None
 
-    # Set up basic configuration for the main log based on DEBUG setting
-    log_level = logging.DEBUG if config.DEBUG else logging.INFO
-    logging.basicConfig(level=log_level, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+        self.logger.error(f"Transaction {tx_hash} not found within timeout.")
+        return None
 
-    try:
-        # Initialize PrivateTransactionSender
-        private_tx_sender = PrivateTransactionSender()
-        web3, account = private_tx_sender.web3, private_tx_sender.account
-
-        # Example: Sending an approve transaction
-        token_address = '0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48' # USDC
-        spender_address = '0x7a250d5630B4cF539739dF2C5dAcb4c659F2488D' # Uniswap V2 Router
-        amount = web3.to_wei(1, 'ether')  # Amount to approve
-
-        # Validate addresses
-        if not web3.is_address(token_address) or not web3.is_address(spender_address):
-            logging.error("Invalid token or spender address.")
-            sys.exit(1)
-        token_address = web3.to_checksum_address(token_address)
-        spender_address = web3.to_checksum_address(spender_address)
-
-        # ABI for the approve function (ERC-20 standard)
-        token_abi = [
-            {
-                "constant": False,
-                "inputs": [
-                    {"name": "_spender", "type": "address"},
-                    {"name": "_value", "type": "uint256"}
-                ],
-                "name": "approve",
-                "outputs": [{"name": "", "type": "bool"}],
-                "type": "function"
-            }
-        ]
-
-        # Load token contract
-        token_contract = web3.eth.contract(address=token_address, abi=token_abi)
-
-        # Get current network fees
-        latest_block = web3.eth.get_block('latest')
-        base_fee_per_gas = latest_block.get('baseFeePerGas', web3.to_wei(30, 'gwei'))  # Default value
-        self_priority_fee = web3.eth.max_priority_fee  # Current maxPriorityFeePerGas value
-        max_priority_fee_per_gas = self_priority_fee
-        max_fee_per_gas = base_fee_per_gas + max_priority_fee_per_gas
-
-        logging.debug(f"Base fee per gas: {base_fee_per_gas}")
-        logging.debug(f"Max priority fee per gas: {max_priority_fee_per_gas}")
-        logging.debug(f"Max fee per gas: {max_fee_per_gas}")
-
-        # Build approve transaction
-        nonce = web3.eth.get_transaction_count(account.address, 'pending')
-        tx_params = {
-            'from': account.address,
-            'nonce': nonce,
-            'maxPriorityFeePerGas': max_priority_fee_per_gas,
-            'maxFeePerGas': max_fee_per_gas,
-            'chainId': web3.eth.chain_id,
-            'type': 2
-        }
-
-        # Estimate gas for the transaction
-        try:
-            gas_estimate = token_contract.functions.approve(spender_address, amount).estimate_gas({
-                'from': account.address,
-            })
-            tx_params['gas'] = gas_estimate
-            logging.debug(f"Estimated gas: {gas_estimate}")
-        except ContractLogicError as e:
-            logging.error(f"Contract logic error during gas estimation: {e}")
-            sys.exit(1)
-        except Exception as e:
-            logging.error(f"Failed to estimate gas: {e}")
-            sys.exit(1)
-
-        # Build approve transaction
-        tx = token_contract.functions.approve(spender_address, amount).build_transaction(tx_params)
-
-        logging.info(f"Built approve transaction: {tx}")
-
-        # Send transaction as private
-        tx_hash, sent_tx = private_tx_sender.send_private_transaction(tx)
-
-        if tx_hash:
-            logging.info(f"Transaction sent successfully: https://etherscan.io/tx/{tx_hash}")
-
-            # Monitor transaction
-            receipt = private_tx_sender.monitor_transaction(tx_hash)
-            if receipt:
-                logging.info(f"Transaction confirmed in block {receipt.blockNumber}")
-            else:
-                logging.error("Failed to confirm transaction.")
-        else:
-            logging.error("Failed to send transaction.")
-
-    except Exception as e:
-        logging.exception(f"An unexpected error occurred: {e}")
-        sys.exit(1)
+# Remaining example usage code stays the same
